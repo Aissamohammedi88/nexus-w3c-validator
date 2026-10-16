@@ -1,0 +1,372 @@
+# ═══════════════════════════════════════════════════════════════════════════# NEXUS W3C VALIDATOR — CMake Multi-Platform Build
+# Auteur : Aissa Mohammedi (DGK)
+# License : NEXUS-OPEN-2.0
+# Description : Compile le projet C/C++ sur Windows, Linux et macOS
+# avec CMake, MSVC, GCC et Clang.
+# ═══════════════════════════════════════════════════════════════════════════
+
+name: CMake Multi-Platform
+
+on:
+push:
+branches: [ "main", "develop", "release/*" ]
+paths:
+- "**.c"
+- "**.cpp"
+- "**.h"
+- "**.hpp"
+- "**CMakeLists.txt"
+- "**.cmake"
+- ".github/workflows/cmake-multi-platform.yml"
+pull_request:
+branches: [ "main", "develop" ]
+workflow_dispatch:
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PERMISSIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+permissions:
+contents: read
+pull-requests: write
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ENV GLOBAL
+# ═══════════════════════════════════════════════════════════════════════════
+
+env:
+BUILD_TYPE: Release
+CMAKE_VERSION: "3.28.3"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# JOBS
+# ═══════════════════════════════════════════════════════════════════════════
+
+jobs:
+
+# ─────────────────────────────────────────────────────────────────────
+# JOB 1 — Build Matrix (3 OS × 2 Compilers)
+# ─────────────────────────────────────────────────────────────────────
+build:
+name: 🏗️ Build (${{ matrix.os }} / ${{ matrix.c_compiler }})
+runs-on: ${{ matrix.os }}
+
+strategy:
+fail-fast: false
+matrix:
+os: [ ubuntu-latest, windows-latest, macos-latest ]
+c_compiler: [ gcc, clang ]
+include:
+# ─── Linux GCC ───
+- os: ubuntu-latest
+c_compiler: gcc
+cpp_compiler: g++
+# ─── Linux Clang ───
+- os: ubuntu-latest
+c_compiler: clang
+cpp_compiler: clang++
+# ─── Windows MSVC ───
+- os: windows-latest
+c_compiler: msvc
+cpp_compiler: msvc
+# ─── macOS Clang ───
+- os: macos-latest
+c_compiler: clang
+cpp_compiler: clang++
+exclude:
+# Windows n'a pas GCC par défaut
+- os: windows-latest
+c_compiler: gcc
+
+steps:
+# ─── Step 1 : Checkout ───
+- name: 📥 Checkout repository
+uses: actions/checkout@v4
+
+# ─── Step 2 : Install Linux dependencies ───
+- name: 🐧 Install Linux dependencies
+if: runner.os == 'Linux'
+run: |
+sudo apt-get update
+sudo apt-get install -y \
+build-essential \
+cmake \
+ninja-build \
+ccache \
+libssl-dev \
+zlib1g-dev \
+libboost-all-dev \
+libsqlite3-dev \
+pkg-config
+
+# ─── Step 3 : Install macOS dependencies ───
+- name: 🍎 Install macOS dependencies
+if: runner.os == 'macOS'
+run: |
+brew update
+brew install cmake ninja ccache openssl boost sqlite3 pkg-config
+
+# ─── Step 4 : Install Windows dependencies ───
+- name: 🪟 Install Windows dependencies
+if: runner.os == 'Windows'
+run: |
+choco install -y cmake ninja ccache
+
+# ─── Step 5 : Setup MSVC (Windows only) ───
+- name: 🪟 Setup MSVC Developer Command Prompt
+if: matrix.c_compiler == 'msvc'
+uses: ilammy/msvc-dev-cmd@v1
+with:
+arch: x64
+
+# ─── Step 6 : Setup ccache ───
+- name: 💾 Setup ccache
+uses: hendrikmuhs/ccache-action@v1.2
+with:
+key: ${{ matrix.os }}-${{ matrix.c_compiler }}-${{ env.BUILD_TYPE }}
+max-size: 500M
+
+# ─── Step 7 : Configure CMake ───
+- name: ⚙️ Configure CMake
+run: |
+cmake -B ${{ github.workspace }}/build \
+-G Ninja \
+-DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+-DCMAKE_C_COMPILER=${{ matrix.c_compiler }} \
+-DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }} \
+-DCMAKE_C_COMPILER_LAUNCHER=ccache \
+-DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+-DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+-S ${{ github.workspace }}
+shell: bash
+
+# ─── Step 8 : Build ───
+- name: 🔨 Build
+run: cmake --build ${{ github.workspace }}/build --config ${{ env.BUILD_TYPE }} --parallel
+shell: bash
+
+# ─── Step 9 : Run tests ───
+- name: 🧪 Run tests
+working-directory: ${{ github.workspace }}/build
+run: ctest --output-on-failure --build-config ${{ env.BUILD_TYPE }}
+shell: bash
+continue-on-error: true
+
+# ─── Step 10 : Generate test report ───
+- name: 📊 Generate test report
+if: always()
+working-directory: ${{ github.workspace }}/build
+run: |
+if [ -f Testing/Temporary/LastTest.log ]; then
+echo "=== Test Results ==="
+cat Testing/Temporary/LastTest.log
+else
+echo "No test log found"
+fi
+shell: bash
+
+# ─── Step 11 : Install ───
+- name: 📦 Install
+run: cmake --install ${{ github.workspace }}/build --config ${{ env.BUILD_TYPE }} --prefix ${{ github.workspace }}/install
+shell: bash
+
+# ─── Step 12 : Upload artifacts ───
+- name: 📤 Upload build artifacts
+uses: actions/upload-artifact@v4
+with:
+name: nexus-${{ matrix.os }}-${{ matrix.c_compiler }}-${{ env.BUILD_TYPE }}
+path: |
+${{ github.workspace }}/build/
+${{ github.workspace }}/install/
+retention-days: 7
+if-no-files-found: warn
+
+# ─── Step 13 : Upload compile commands ───
+- name: 📤 Upload compile_commands.json
+if: matrix.c_compiler == 'gcc' && matrix.os == 'ubuntu-latest'
+uses: actions/upload-artifact@v4
+with:
+name: compile-commands
+path: ${{ github.workspace }}/build/compile_commands.json
+retention-days: 30
+
+# ─────────────────────────────────────────────────────────────────────
+# JOB 2 — Static Analysis (Linux uniquement)
+# ─────────────────────────────────────────────────────────────────────
+static-analysis:
+name: 🔍 Static Analysis
+runs-on: ubuntu-latest
+needs: build
+
+steps:
+- name: 📥 Checkout repository
+uses: actions/checkout@v4
+
+- name: 🐧 Install dependencies
+run: |
+sudo apt-get update
+sudo apt-get install -y \
+build-essential \
+cmake \
+ninja-build \
+clang \
+clang-tidy \
+cppcheck
+
+# ─── Clang-Tidy ───
+- name: 🔍 Configure for clang-tidy
+run: |
+cmake -B build \
+-G Ninja \
+-DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+-DCMAKE_C_COMPILER=clang \
+-DCMAKE_CXX_COMPILER=clang++ \
+-DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+-S .
+
+- name: 🔍 Run clang-tidy
+run: |
+if [ -f build/compile_commands.json ]; then
+find . -name "*.cpp" -o -name "*.c" | head -20 | while read file; do
+clang-tidy -p build "$file" || true
+done
+fi
+
+# ─── Cppcheck ───
+- name: 🔍 Run cppcheck
+run: |
+cppcheck \
+--enable=all \
+--inconclusive \
+--std=c++17 \
+--suppress=missingIncludeSystem \
+--suppress=unusedFunction \
+--quiet \
+--xml \
+--output-file=cppcheck.xml \
+. || true
+
+# ─── Upload results ───
+- name: 📤 Upload static analysis results
+uses: actions/upload-artifact@v4
+with:
+name: static-analysis
+path: |
+cppcheck.xml
+retention-days: 7
+if-no-files-found: ignore
+
+# ─────────────────────────────────────────────────────────────────────
+# JOB 3 — Coverage (Linux + GCC uniquement)
+# ─────────────────────────────────────────────────────────────────────
+coverage:
+name: 📊 Code Coverage
+runs-on: ubuntu-latest
+needs: build
+if: github.ref == 'refs/heads/main'
+
+steps:
+- name: 📥 Checkout repository
+uses: actions/checkout@v4
+
+- name: 🐧 Install coverage tools
+run: |
+sudo apt-get update
+sudo apt-get install -y \
+build-essential \
+cmake \
+ninja-build \
+gcovr \
+lcov
+
+- name: 📊 Configure with coverage
+run: |
+cmake -B build-coverage \
+-G Ninja \
+-DCMAKE_BUILD_TYPE=Debug \
+-DCMAKE_C_COMPILER=gcc \
+-DCMAKE_CXX_COMPILER=g++ \
+-DCMAKE_C_FLAGS="--coverage -fprofile-arcs -ftest-coverage" \
+-DCMAKE_CXX_FLAGS="--coverage -fprofile-arcs -ftest-coverage" \
+-DCMAKE_EXE_LINKER_FLAGS="--coverage" \
+-S .
+
+- name: 🔨 Build with coverage
+run: cmake --build build-coverage --parallel
+
+- name: 🧪 Run tests with coverage
+working-directory: build-coverage
+run: ctest --output-on-failure || true
+
+- name: 📊 Generate coverage report
+run: |
+gcovr \
+--root . \
+--xml coverage.xml \
+--html coverage.html \
+--html-details \
+--exclude 'tests/.*' \
+--exclude 'build.*' \
+--exclude '.*external.*' \
+--print-summary
+
+- name: 📤 Upload coverage report
+uses: actions/upload-artifact@v4
+with:
+name: coverage-report
+path: |
+coverage.xml
+coverage.html
+retention-days: 30
+
+# ─── Upload to Codecov (optionnel) ───
+- name: 📤 Upload to Codecov
+uses: codecov/codecov-action@v4
+continue-on-error: true
+with:
+files: coverage.xml
+flags: unittests
+name: nexus-w3c-validator
+
+# ─────────────────────────────────────────────────────────────────────
+# JOB 4 — Release (tags uniquement)
+# ─────────────────────────────────────────────────────────────────────
+release:
+name: 🚀 Release
+runs-on: ubuntu-latest
+needs: [ build, static-analysis ]
+if: startsWith(github.ref, 'refs/tags/v')
+
+steps:
+- name: 📥 Checkout repository
+uses: actions/checkout@v4
+
+- name: 🐧 Install dependencies
+run: |
+sudo apt-get update
+sudo apt-get install -y build-essential cmake ninja-build
+
+- name: 🔨 Build release
+run: |
+cmake -B build-release \
+-G Ninja \
+-DCMAKE_BUILD_TYPE=Release \
+-DCMAKE_INSTALL_PREFIX=dist \
+-S .
+cmake --build build-release --parallel
+cmake --install build-release
+
+- name: 📦 Create tarball
+run: |
+cd dist
+tar -czvf ../nexus-w3c-validator-linux-x64.tar.gz .
+cd ..
+
+- name: 🚀 Create GitHub Release
+uses: softprops/action-gh-release@v2
+with:
+files: |
+nexus-w3c-validator-linux-x64.tar.gz
+generate_release_notes: true
+draft: false
+prerelease: false
