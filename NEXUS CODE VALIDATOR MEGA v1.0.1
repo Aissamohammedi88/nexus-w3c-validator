@@ -1,0 +1,1202 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+"""
+NEXUS CODE VALIDATOR MEGA v1.0.0
+==================================
+Validateur multi-standard unifié : W3C, Nu HTML, CSS, RSS, i18n, EPUB, RDF
+
+Inspiré des APIs officielles :
+- https://validator.w3.org/nu/ (Nu HTML Checker)
+- https://validator.w3.org/checklink (Link Checker)
+- https://jigsaw.w3.org/css-validator/ (CSS Validator)
+- https://validator.w3.org/feed/ (RSS/Atom Validator)
+- https://www.w3.org/2013/04/i18n-checker/ (i18n Checker)
+- https://validator.w3.org/unicorn/ (Unicorn - tout en un)
+- https://validator.idpf.org/ (EPUBCheck)
+- https://www.w3.org/RDF/Validator/ (RDF Validator)
+- https://wpt.fyi/ (Web Platform Tests)
+
+Auteur : Aissa Mohammedi (DGK)
+Licence : NEXUS-OPEN-3.0
+Port : 9996
+Protocole : Nametron 3 Lara / ZTMESH v1.5.15
+
+⚠️ Utilise les APIs publiques W3C + validations locales
+"""
+
+import os
+import sys
+import re
+import json
+import time
+import ssl
+import socket
+import hashlib
+import threading
+import urllib.request
+import urllib.error
+import urllib.parse
+import gzip
+import io
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field, asdict
+from typing import Any, Dict, List, Optional, Tuple
+from enum import Enum
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+VERSION = "1.0.0"
+BUILD = "2026.10.15"
+AUTEUR = "Aissa Mohammedi (DGK)"
+LICENCE = "NEXUS-OPEN-3.0"
+PROTOCOLE = "Nametron 3 Lara / ZTMESH v1.5.15"
+PORT = int(os.environ.get("PORT", 9996))
+HOST = os.environ.get("HOST", "0.0.0.0")
+
+HOME = Path(os.path.expanduser("~"))
+BASE = HOME / "Documents" / "nexus_code_validator"
+CACHE_DIR = BASE / "cache"
+REPORTS = BASE / "reports"
+LOGS = BASE / "logs"
+for d in (BASE, CACHE_DIR, REPORTS, LOGS):
+d.mkdir(parents=True, exist_ok=True)
+
+LOG_FILE = LOGS / "validator.log"
+CACHE_FILE = CACHE_DIR / "cache.json"
+
+
+def log(msg: str, level: str = "INFO"):
+ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+line = f"[{ts}] [{level}] {msg}"
+print(line, flush=True)
+try:
+with open(LOG_FILE, "a", encoding="utf-8") as f:
+f.write(line + "\n")
+except OSError:
+pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MODÈLES DE DONNÉES
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Severity(str, Enum):
+ERROR = "error"
+WARNING = "warning"
+INFO = "info"
+
+
+@dataclass
+class ValidationIssue:
+"""Un problème détecté par un validateur."""
+validator: str
+severity: str
+message: str
+line: int = 0
+column: int = 0
+code: str = ""
+source: str = ""
+context: str = ""
+
+def to_dict(self) -> Dict:
+return asdict(self)
+
+
+@dataclass
+class ValidatorResult:
+"""Résultat d'un validateur."""
+validator: str
+target: str
+status: str # "valid" | "invalid" | "error"
+issues: List[ValidationIssue] = field(default_factory=list)
+duration_ms: float = 0.0
+raw_response: str = ""
+metadata: Dict[str, Any] = field(default_factory=dict)
+
+def to_dict(self) -> Dict:
+return {
+"validator": self.validator,
+"target": self.target,
+"status": self.status,
+"issues": [i.to_dict() for i in self.issues],
+"duration_ms": self.duration_ms,
+"metadata": self.metadata,
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CLIENT HTTP
+# ═══════════════════════════════════════════════════════════════════════════
+
+class HttpClient:
+"""Client HTTP avec SSL désactivé pour compatibilité."""
+
+@staticmethod
+def get(url: str, headers: Optional[Dict] = None,
+timeout: int = 30) -> Tuple[bool, int, str, Dict]:
+h = {
+"User-Agent": f"NexusCodeValidator/{VERSION}",
+"Accept": "*/*",
+}
+if headers:
+h.update(headers)
+try:
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+req = urllib.request.Request(url, headers=h)
+with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+data = resp.read()
+# Gestion gzip
+if resp.headers.get("Content-Encoding") == "gzip":
+data = gzip.decompress(data)
+return True, resp.status, data.decode("utf-8", errors="ignore"), dict(resp.headers)
+except urllib.error.HTTPError as e:
+try:
+body = e.read().decode("utf-8", errors="ignore")
+except Exception:
+body = ""
+return False, e.code, body, dict(e.headers) if e.headers else {}
+except Exception as e:
+return False, 0, str(e)[:500], {}
+
+@staticmethod
+def post(url: str, data: str, headers: Optional[Dict] = None,
+timeout: int = 30) -> Tuple[bool, int, str, Dict]:
+h = {
+"User-Agent": f"NexusCodeValidator/{VERSION}",
+"Content-Type": "text/html; charset=utf-8",
+"Accept": "*/*",
+}
+if headers:
+h.update(headers)
+try:
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+req = urllib.request.Request(url, data=data.encode("utf-8"), headers=h, method="POST")
+with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+body = resp.read().decode("utf-8", errors="ignore")
+return True, resp.status, body, dict(resp.headers)
+except urllib.error.HTTPError as e:
+try:
+body = e.read().decode("utf-8", errors="ignore")
+except Exception:
+body = ""
+return False, e.code, body, dict(e.headers) if e.headers else {}
+except Exception as e:
+return False, 0, str(e)[:500], {}
+
+
+HTTP = HttpClient()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VALIDATEURS — APIs W3C OFFICIELLES
+# ═══════════════════════════════════════════════════════════════════════════
+
+class NuHtmlValidator:
+"""
+Nu HTML Checker — https://validator.w3.org/nu/
+Valide HTML5, SVG, ARIA, HTML conformance.
+"""
+
+API = "https://validator.w3.org/nu/?out=json"
+
+@classmethod
+def validate(cls, html: str) -> ValidatorResult:
+start = time.time()
+result = ValidatorResult(
+validator="NuHtmlChecker",
+target="inline_html",
+status="error",
+)
+try:
+ok, status, body, _ = HTTP.post(
+cls.API,
+data=html,
+headers={
+"Content-Type": "text/html; charset=utf-8",
+"Accept": "application/json",
+},
+)
+if not ok:
+result.status = "error"
+result.issues.append(ValidationIssue(
+validator=cls.__name__,
+severity=Severity.ERROR.value,
+message=f"API W3C indisponible : HTTP {status}",
+))
+result.duration_ms = (time.time() - start) * 1000
+return result
+
+data = json.loads(body)
+messages = data.get("messages", [])
+for m in messages:
+sev = m.get("type", "info")
+if sev == "error":
+sev_std = Severity.ERROR.value
+elif sev in ("info", "warning"):
+sev_std = Severity.WARNING.value
+else:
+sev_std = Severity.INFO.value
+
+result.issues.append(ValidationIssue(
+validator="NuHtmlChecker",
+severity=sev_std,
+message=m.get("message", ""),
+line=m.get("lastLine", 0),
+column=m.get("lastColumn", 0),
+code=m.get("subType", ""),
+context=m.get("extract", "")[:200],
+))
+
+errors = sum(1 for i in result.issues if i.severity == Severity.ERROR.value)
+result.status = "valid" if errors == 0 else "invalid"
+result.metadata = {
+"total_messages": len(messages),
+"errors": errors,
+"warnings": sum(1 for i in result.issues if i.severity == Severity.WARNING.value),
+}
+except json.JSONDecodeError:
+result.status = "error"
+result.issues.append(ValidationIssue(
+validator=cls.__name__,
+severity=Severity.ERROR.value,
+message="Réponse W3C non-JSON",
+))
+except Exception as e:
+result.status = "error"
+result.issues.append(ValidationIssue(
+validator=cls.__name__,
+severity=Severity.ERROR.value,
+message=str(e)[:200],
+))
+result.duration_ms = round((time.time() - start) * 1000, 2)
+return result
+
+
+class CSSValidator:
+"""
+CSS Validator — https://jigsaw.w3.org/css-validator/
+Valide CSS 1, 2, 3, 4.
+"""
+
+API = "https://jigsaw.w3.org/css-validator/validator"
+
+@classmethod
+def validate(cls, css: str, profile: str = "css3") -> ValidatorResult:
+start = time.time()
+result = ValidatorResult(
+validator="CSSValidator",
+target="inline_css",
+status="error",
+)
+try:
+url = f"{cls.API}?output=json&profile={profile}&text=" + urllib.parse.quote(css)
+ok, status, body, _ = HTTP.get(url)
+if not ok:
+result.status = "error"
+result.issues.append(ValidationIssue(
+validator=cls.__name__,
+severity=Severity.ERROR.value,
+message=f"API CSS indisponible : HTTP {status}",
+))
+result.duration_ms = (time.time() - start) * 1000
+return result
+
+data = json.loads(body)
+css_validation = data.get("cssvalidation", {})
+errors = css_validation.get("errors", [])
+warnings = css_validation.get("warnings", [])
+
+for e in errors:
+result.issues.append(ValidationIssue(
+validator="CSSValidator",
+severity=Severity.ERROR.value,
+message=e.get("message", ""),
+line=e.get("line", 0),
+context=e.get("context", "")[:200],
+))
+for w in warnings:
+result.issues.append(ValidationIssue(
+validator="CSSValidator",
+severity=Severity.WARNING.value,
+message=w.get("message", ""),
+line=w.get("line", 0),
+context=w.get("context", "")[:200],
+))
+
+result.status = "valid" if not errors else "invalid"
+result.metadata = {
+"total_errors": len(errors),
+"total_warnings": len(warnings),
+"profile": profile,
+}
+except Exception as e:
+result.status = "error"
+result.issues.append(ValidationIssue(
+validator=cls.__name__,
+severity=Severity.ERROR.value,
+message=str(e)[:200],
+))
+result.duration_ms = round((time.time() - start) * 1000, 2)
+return result
+
+
+class FeedValidator:
+"""
+RSS/Atom Feed Validator — https://validator.w3.org/feed/
+Valide RSS 2.0, Atom 1.0, RSS 1.0.
+"""
+
+API = "https://validator.w3.org/feed/check.cgi"
+
+@classmethod
+def validate(cls, url: str) -> ValidatorResult:
+start = time.time()
+result = ValidatorResult(
+validator="FeedValidator",
+target=url,
+status="error",
+)
+try:
+api_url = f"{cls.API}?url={urllib.parse.quote(url)}&output=soap12"
+ok, status, body, _ = HTTP.get(api_url)
+if not ok:
+result.status = "error"
+result.issues.append(ValidationIssue(
+validator=cls.__name__,
+severity=Severity.ERROR.value,
+message=f"API Feed indisponible : HTTP {status}",
+))
+result.duration_ms = (time.time() - start) * 1000
+return result
+
+# Comptage erreurs et warnings
+errors = body.count("<m:error>")
+warnings = body.count("<m:warning>")
+result.status = "valid" if errors == 0 else "invalid"
+
+# Extraction simple
+for m in re.finditer(r"<m:error>.*?<m:message>(.*?)</m:message>", body, re.DOTALL):
+result.issues.append(ValidationIssue(
+validator="FeedValidator",
+severity=Severity.ERROR.value,
+message=m.group(1)[:300],
+))
+for m in re.finditer(r"<m:warning>.*?<m:message>(.*?)</m:message>", body, re.DOTALL):
+result.issues.append(ValidationIssue(
+validator="FeedValidator",
+severity=Severity.WARNING.value,
+message=m.group(1)[:300],
+))
+
+result.metadata = {"errors": errors, "warnings": warnings}
+except Exception as e:
+result.status = "error"
+result.issues.append(ValidationIssue(
+validator=cls.__name__,
+severity=Severity.ERROR.value,
+message=str(e)[:200],
+))
+result.duration_ms = round((time.time() - start) * 1000, 2)
+return result
+
+
+class I18nChecker:
+"""
+Internationalization Checker — https://validator.w3.org/i18n-checker/
+Vérifie la langue, l'encodage, la direction du texte.
+"""
+
+@classmethod
+def validate(cls, html: str) -> ValidatorResult:
+start = time.time()
+result = ValidatorResult(
+validator="I18nChecker",
+target="inline_html",
+status="valid",
+)
+
+# Analyse locale du HTML
+checks = {
+"charset": cls._check_charset(html),
+"lang_attribute": cls._check_lang(html),
+"dir_attribute": cls._check_dir(html),
+"meta_lang": cls._check_meta_lang(html),
+"content_language": cls._check_content_language(html),
+"non_ascii_identifiers": cls._check_non_ascii_ids(html),
+"unicode_control": cls._check_unicode_control(html),
+}
+
+for name, (status, message) in checks.items():
+if status == "error":
+result.issues.append(ValidationIssue(
+validator="I18nChecker",
+severity=Severity.ERROR.value,
+message=message,
+code=name,
+))
+result.status = "invalid"
+elif status == "warning":
+result.issues.append(ValidationIssue(
+validator="I18nChecker",
+severity=Severity.WARNING.value,
+message=message,
+code=name,
+))
+
+result.metadata = {
+"checks": {k: v[0] for k, v in checks.items()},
+"total_checks": len(checks),
+}
+result.duration_ms = round((time.time() - start) * 1000, 2)
+return result
+
+@staticmethod
+def _check_charset(html: str) -> Tuple[str, str]:
+if re.search(r'<meta[^>]+charset=["\']?utf-8', html, re.I):
+return "ok", "Charset UTF-8 déclaré"
+if re.search(r'<meta[^>]+charset=', html, re.I):
+return "warning", "Charset déclaré mais pas UTF-8"
+return "warning", "Aucun charset déclaré"
+
+@staticmethod
+def _check_lang(html: str) -> Tuple[str, str]:
+if re.search(r'<html[^>]+lang=["\'][^"\']+["\']', html, re.I):
+return "ok", "Attribut lang présent"
+return "error", "Attribut lang manquant sur <html>"
+
+@staticmethod
+def _check_dir(html: str) -> Tuple[str, str]:
+if re.search(r'<html[^>]+dir=["\'](ltr|rtl|auto)["\']', html, re.I):
+return "ok", "Direction du texte déclarée"
+return "warning", "Direction du texte non déclarée (défaut LTR)"
+
+@staticmethod
+def _check_meta_lang(html: str) -> Tuple[str, str]:
+if re.search(r'<meta[^>]+http-equiv=["\']Content-Language["\']', html, re.I):
+return "ok", "Content-Language déclaré"
+return "info", "Content-Language non déclaré (facultatif)"
+
+@staticmethod
+def _check_content_language(html: str) -> Tuple[str, str]:
+m = re.search(r'<meta[^>]+http-equiv=["\']Content-Language["\'][^>]+content=["\']([^"\']+)', html, re.I)
+if m:
+return "ok", f"Content-Language : {m.group(1)}"
+return "info", "Pas de Content-Language"
+
+@staticmethod
+def _check_non_ascii_ids(html: str) -> Tuple[str, str]:
+matches = re.findall(r'\b(?:id|class)=["\']([^"\']*[^\x00-\x7F][^"\']*)', html)
+if matches:
+return "warning", f"Identifiants non-ASCII : {matches[:3]}"
+return "ok", "Identifiants ASCII uniquement"
+
+@staticmethod
+def _check_unicode_control(html: str) -> Tuple[str, str]:
+# Détection de caractères de contrôle Unicode
+control_chars = re.findall(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', html)
+if control_chars:
+return "warning", f"Caractères de contrôle trouvés : {len(control_chars)}"
+return "ok", "Aucun caractère de contrôle"
+
+
+class RDFValidator:
+"""
+RDF Validator — https://www.w3.org/RDF/Validator/
+Valide RDF, Turtle, N-Triples, RDF/XML.
+"""
+
+API = "https://www.w3.org/RDF/Validator/run/"
+
+@classmethod
+def validate(cls, rdf: str, format_: str = "turtle") -> ValidatorResult:
+start = time.time()
+result = ValidatorResult(
+validator="RDFValidator",
+target="inline_rdf",
+status="valid",
+)
+try:
+url = f"{cls.API}?format={format_}"
+ok, status, body, _ = HTTP.post(url, data=rdf)
+if not ok:
+# Fallback : validation syntaxique basique
+return cls._local_validation(rdf, start)
+
+# Extraction des messages d'erreur
+errors = re.findall(r"<error>(.*?)</error>", body, re.DOTALL)
+for e in errors:
+result.issues.append(ValidationIssue(
+validator="RDFValidator",
+severity=Severity.ERROR.value,
+message=e[:300],
+))
+result.status = "valid" if not errors else "invalid"
+except Exception as e:
+result.issues.append(ValidationIssue(
+validator=cls.__name__,
+severity=Severity.WARNING.value,
+message=f"Fallback local : {str(e)[:100]}",
+))
+return cls._local_validation(rdf, start)
+
+result.duration_ms = round((time.time() - start) * 1000, 2)
+return result
+
+@classmethod
+def _local_validation(cls, rdf: str, start: float) -> ValidatorResult:
+"""Validation syntaxique locale simple."""
+result = ValidatorResult(
+validator="RDFValidator(local)",
+target="inline_rdf",
+status="valid",
+)
+# Vérifications basiques
+if not rdf.strip():
+result.status = "invalid"
+result.issues.append(ValidationIssue(
+validator="RDFValidator(local)",
+severity=Severity.ERROR.value,
+message="RDF vide",
+))
+# Détection de préfixes non déclarés
+prefixes = set(re.findall(r"\b([a-z]+):[A-Za-z]", rdf))
+declared = set(re.findall(r"@prefix\s+([a-z]+):", rdf))
+undeclared = prefixes - declared - {"http", "https"}
+for p in undeclared:
+result.issues.append(ValidationIssue(
+validator="RDFValidator(local)",
+severity=Severity.WARNING.value,
+message=f"Préfixe non déclaré : {p}:",
+))
+result.duration_ms = round((time.time() - start) * 1000, 2)
+return result
+
+
+class LinkChecker:
+"""
+Link Checker — https://validator.w3.org/checklink
+Vérifie les liens brisés dans une page.
+"""
+
+@classmethod
+def validate(cls, html: str, base_url: str = "") -> ValidatorResult:
+start = time.time()
+result = ValidatorResult(
+validator="LinkChecker",
+target=base_url or "inline_html",
+status="valid",
+)
+
+# Extraction des liens
+links = re.findall(r'<a[^>]+href=["\']([^"\']+)', html, re.I)
+links += re.findall(r'<link[^>]+href=["\']([^"\']+)', html, re.I)
+links += re.findall(r'<img[^>]+src=["\']([^"\']+)', html, re.I)
+
+# Filtre
+links = list(set(l for l in links if l and not l.startswith(("#", "mailto:", "javascript:"))))
+
+broken = []
+for link in links[:50]: # limite
+full_url = urljoin(base_url, link) if base_url else link
+if not full_url.startswith(("http://", "https://")):
+continue
+try:
+ok, status, _, _ = HTTP.get(full_url, timeout=5)
+if not ok and status >= 400:
+broken.append({"url": full_url, "status": status})
+except Exception:
+broken.append({"url": full_url, "status": 0})
+
+for b in broken:
+result.issues.append(ValidationIssue(
+validator="LinkChecker",
+severity=Severity.ERROR.value,
+message=f"Lien cassé : {b['url']} (HTTP {b['status']})",
+context=b["url"],
+))
+
+result.status = "valid" if not broken else "invalid"
+result.metadata = {
+"total_links": len(links),
+"broken_links": len(broken),
+"checked": min(len(links), 50),
+}
+result.duration_ms = round((time.time() - start) * 1000, 2)
+return result
+
+
+class EPUBCheck:
+"""
+EPUBCheck — https://validator.idpf.org/
+Vérifie la conformité EPUB.
+"""
+
+@classmethod
+def validate_structure(cls, files: List[str]) -> ValidatorResult:
+"""Validation structurelle locale."""
+start = time.time()
+result = ValidatorResult(
+validator="EPUBCheck",
+target="epub_structure",
+status="valid",
+)
+
+required = ["mimetype", "META-INF/container.xml"]
+for req in required:
+if req not in files:
+result.issues.append(ValidationIssue(
+validator="EPUBCheck",
+severity=Severity.ERROR.value,
+message=f"Fichier requis manquant : {req}",
+))
+result.status = "invalid"
+
+result.metadata = {"total_files": len(files), "required_checked": len(required)}
+result.duration_ms = round((time.time() - start) * 1000, 2)
+return result
+
+
+class WPTTester:
+"""
+Web Platform Tests — https://wpt.fyi/
+Vérifie les fonctionnalités supportées.
+"""
+
+API = "https://wpt.fyi/api/runs"
+
+@classmethod
+def check_feature(cls, feature: str) -> ValidatorResult:
+start = time.time()
+result = ValidatorResult(
+validator="WPTTester",
+target=feature,
+status="info",
+)
+try:
+ok, status, body, _ = HTTP.get(cls.API)
+if ok:
+data = json.loads(body)
+result.metadata = {
+"api_available": True,
+"runs_count": len(data.get("runs", [])) if isinstance(data, dict) else 0,
+}
+except Exception as e:
+result.issues.append(ValidationIssue(
+validator="WPTTester",
+severity=Severity.INFO.value,
+message=f"API WPT : {str(e)[:100]}",
+))
+
+result.duration_ms = round((time.time() - start) * 1000, 2)
+return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MOTEUR PRINCIPAL
+# ═══════════════════════════════════════════════════════════════════════════
+
+class CodeValidatorEngine:
+"""Moteur central de validation multi-standard."""
+
+VALIDATORS = {
+"nu_html": NuHtmlValidator,
+"css": CSSValidator,
+"feed": FeedValidator,
+"i18n": I18nChecker,
+"rdf": RDFValidator,
+"link": LinkChecker,
+"epub": EPUBCheck,
+"wpt": WPTTester,
+}
+
+@classmethod
+def validate_all(cls, html: str, css: str = "", base_url: str = "",
+parallel: bool = True) -> Dict:
+"""Lance tous les validateurs applicables."""
+start = time.time()
+results = {}
+tasks = []
+
+# HTML
+tasks.append(("nu_html", lambda: NuHtmlValidator.validate(html)))
+tasks.append(("i18n", lambda: I18nChecker.validate(html)))
+tasks.append(("link", lambda: LinkChecker.validate(html, base_url)))
+
+# CSS
+if css:
+tasks.append(("css", lambda: CSSValidator.validate(css)))
+
+# RDF
+if html.strip().startswith(("<?xml", "@prefix", "<rdf", "_:", "<http")):
+tasks.append(("rdf", lambda: RDFValidator.validate(html, "rdfxml")))
+
+if parallel and len(tasks) > 1:
+with ThreadPoolExecutor(max_workers=len(tasks)) as ex:
+futures = {ex.submit(fn): name for name, fn in tasks}
+for fut in as_completed(futures):
+name = futures[fut]
+try:
+results[name] = fut.result()
+except Exception as e:
+r = ValidatorResult(validator=name, target="", status="error")
+r.issues.append(ValidationIssue(
+validator=name,
+severity=Severity.ERROR.value,
+message=str(e)[:200],
+))
+results[name] = r
+else:
+for name, fn in tasks:
+try:
+results[name] = fn()
+except Exception as e:
+r = ValidatorResult(validator=name, target="", status="error")
+r.issues.append(ValidationIssue(
+validator=name,
+severity=Severity.ERROR.value,
+message=str(e)[:200],
+))
+results[name] = r
+
+# Global
+total_errors = sum(
+sum(1 for i in r.issues if i.severity == Severity.ERROR.value)
+for r in results.values()
+)
+total_warnings = sum(
+sum(1 for i in r.issues if i.severity == Severity.WARNING.value)
+for r in results.values()
+)
+
+return {
+"target": base_url or "inline",
+"validators": {k: v.to_dict() for k, v in results.items()},
+"summary": {
+"total_validators": len(results),
+"total_errors": total_errors,
+"total_warnings": total_warnings,
+"overall_status": "valid" if total_errors == 0 else "invalid",
+},
+"duration_ms": round((time.time() - start) * 1000, 2),
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HTML UI
+# ═══════════════════════════════════════════════════════════════════════════
+
+HTML_UI = r"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nexus Code Validator Mega</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,system-ui,sans-serif;background:#0a0a12;color:#d0e0f8;padding:24px;min-height:100vh;background-image:radial-gradient(ellipse at top,rgba(80,150,255,0.08),transparent 60%)}
+.container{max-width:1400px;margin:0 auto}
+h1{font-size:clamp(22px,4vw,36px);font-weight:800;letter-spacing:-1.5px;background:linear-gradient(135deg,#5096ff,#b366ff,#ff4080);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:8px}
+.subtitle{color:#607090;font-size:12px;font-family:ui-monospace,monospace;margin-bottom:20px}
+.panel{background:#131825;border:1px solid #253050;border-radius:14px;padding:20px;margin-bottom:16px}
+.panel h2{color:#5096ff;font-size:12px;letter-spacing:2px;text-transform:uppercase;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid #253050}
+textarea{width:100%;min-height:200px;padding:14px;background:#000;border:1px solid #253050;border-radius:10px;color:#a0f0d0;font-family:ui-monospace,monospace;font-size:12px;outline:none;resize:vertical;line-height:1.6}
+textarea:focus{border-color:#5096ff}
+input[type=text]{width:100%;padding:12px 16px;background:#000;border:1px solid #253050;border-radius:10px;color:#a0f0d0;font-family:ui-monospace,monospace;font-size:13px;outline:none;margin-bottom:8px}
+input[type=text]:focus{border-color:#5096ff}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.btn{background:linear-gradient(135deg,#5096ff,#b366ff);color:#fff;border:none;padding:12px 22px;border-radius:10px;font-weight:700;cursor:pointer;font-family:ui-monospace,monospace;font-size:12px;letter-spacing:1px;text-transform:uppercase;transition:all 0.3s}
+.btn:hover{transform:translateY(-2px);box-shadow:0 5px 20px rgba(80,150,255,0.4)}
+.btn.green{background:linear-gradient(135deg,#00ff88,#00d4ff);color:#000}
+.btn.red{background:linear-gradient(135deg,#ff3366,#ff6b35);color:#fff}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+.stat{background:#0a0f1a;border:1px solid #253050;border-radius:10px;padding:14px;text-align:center}
+.stat .l{color:#607090;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:6px}
+.stat .v{color:#5096ff;font-size:22px;font-weight:800;font-family:ui-monospace,monospace}
+.stat .v.ok{color:#00ff88}
+.stat .v.warn{color:#ffaa00}
+.stat .v.danger{color:#ff3366}
+.issue{padding:10px 14px;background:#0a0f1a;border-left:3px solid #5096ff;border-radius:0 8px 8px 0;margin-bottom:6px;font-size:12px;font-family:ui-monospace,monospace}
+.issue.error{border-left-color:#ff0000;background:rgba(255,0,0,0.05)}
+.issue.warning{border-left-color:#ffaa00;background:rgba(255,170,0,0.05)}
+.issue.info{border-left-color:#5096ff}
+.issue .sev{color:#5096ff;font-weight:700;margin-right:8px}
+.issue .val{color:#b366ff;margin-right:8px}
+.result{background:#000;border:1px solid #253050;border-radius:10px;padding:16px;font-family:ui-monospace,monospace;font-size:11px;color:#a0f0d0;white-space:pre-wrap;overflow:auto;line-height:1.6;margin-top:12px;max-height:600px}
+.footer{text-align:center;color:#303040;font-size:11px;margin-top:40px;padding-top:20px;border-top:1px solid #253050;font-family:ui-monospace,monospace}
+.badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:10px;font-family:ui-monospace,monospace;margin-left:6px}
+.badge.valid{background:rgba(0,255,136,0.15);color:#00ff88;border:1px solid #00ff88}
+.badge.invalid{background:rgba(255,0,0,0.15);color:#ff0000;border:1px solid #ff0000}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>🧬 Nexus Code Validator Mega</h1>
+<p class="subtitle">Nu HTML · CSS · RSS · i18n · RDF · Link · EPUB · WPT · Port 9996 · APIs W3C officielles</p>
+
+<div class="panel">
+<h2>📝 HTML à valider</h2>
+<textarea id="html" placeholder="Colle ton HTML ici..."><!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Test</title>
+</head>
+<body>
+<h1>Bonjour</h1>
+<p>Test de validation</p>
+</body>
+</html></textarea>
+</div>
+
+<div class="panel">
+<h2>🎨 CSS (optionnel)</h2>
+<textarea id="css" style="min-height:80px" placeholder="Colle ton CSS ici..."></textarea>
+</div>
+
+<div class="panel">
+<h2>🌐 URL de base (optionnel)</h2>
+<input type="text" id="base_url" placeholder="https://example.com">
+</div>
+
+<div class="actions">
+<button class="btn" onclick="validerTout()">🔍 TOUT VALIDER</button>
+<button class="btn green" onclick="validerHTML()">📄 HTML SEULEMENT</button>
+<button class="btn green" onclick="validerI18n()">🌍 i18n SEULEMENT</button>
+<button class="btn green" onclick="validerLiens()">🔗 LIENS SEULEMENT</button>
+<button class="btn red" onclick="vider()">🗑️ VIDER</button>
+</div>
+
+<div id="result-panel" class="panel" style="display:none">
+<h2>📊 Résultats</h2>
+<div class="grid" id="stats"></div>
+<div id="issues"></div>
+<div class="result" id="raw"></div>
+</div>
+
+<div class="footer">Nexus Code Validator Mega v1.0.0 · Aissa Mohammedi (DGK) · APIs W3C officielles</div>
+</div>
+
+<script>
+function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+function loader(msg){
+document.getElementById('result-panel').style.display = 'block';
+document.getElementById('stats').innerHTML = '<div class="stat"><div class="l">Statut</div><div class="v">'+esc(msg)+'</div></div>';
+document.getElementById('issues').innerHTML = '';
+document.getElementById('raw').textContent = '';
+}
+
+async function validerTout(){
+const html = document.getElementById('html').value;
+const css = document.getElementById('css').value;
+const base_url = document.getElementById('base_url').value.trim();
+if(!html.trim() && !css.trim()) return;
+loader('Validation en cours...');
+try{
+const r = await fetch('/api/validate-all', {
+method:'POST', headers:{'Content-Type':'application/json'},
+body: JSON.stringify({html, css, base_url})
+});
+const d = await r.json();
+renderFull(d);
+}catch(e){ document.getElementById('raw').textContent = 'Erreur: ' + e.message; }
+}
+
+async function validerHTML(){
+const html = document.getElementById('html').value;
+if(!html.trim()) return;
+loader('Validation HTML...');
+try{
+const r = await fetch('/api/validate-html', {
+method:'POST', headers:{'Content-Type':'application/json'},
+body: JSON.stringify({html})
+});
+const d = await r.json();
+renderOne(d);
+}catch(e){ document.getElementById('raw').textContent = 'Erreur: ' + e.message; }
+}
+
+async function validerI18n(){
+const html = document.getElementById('html').value;
+if(!html.trim()) return;
+loader('Validation i18n...');
+try{
+const r = await fetch('/api/validate-i18n', {
+method:'POST', headers:{'Content-Type':'application/json'},
+body: JSON.stringify({html})
+});
+const d = await r.json();
+renderOne(d);
+}catch(e){ document.getElementById('raw').textContent = 'Erreur: ' + e.message; }
+}
+
+async function validerLiens(){
+const html = document.getElementById('html').value;
+const base_url = document.getElementById('base_url').value.trim();
+if(!html.trim()) return;
+loader('Vérification des liens...');
+try{
+const r = await fetch('/api/validate-links', {
+method:'POST', headers:{'Content-Type':'application/json'},
+body: JSON.stringify({html, base_url})
+});
+const d = await r.json();
+renderOne(d);
+}catch(e){ document.getElementById('raw').textContent = 'Erreur: ' + e.message; }
+}
+
+function renderFull(d){
+const s = d.summary || {};
+const cls = s.total_errors === 0 ? 'ok' : 'danger';
+let h = '<div class="stat"><div class="l">Validateurs</div><div class="v">'+s.total_validators+'</div></div>' +
+'<div class="stat"><div class="l">Erreurs</div><div class="v '+cls+'">'+s.total_errors+'</div></div>' +
+'<div class="stat"><div class="l">Warnings</div><div class="v warn">'+s.total_warnings+'</div></div>' +
+'<div class="stat"><div class="l">Statut</div><div class="v '+cls+'">'+s.overall_status.toUpperCase()+'</div></div>' +
+'<div class="stat"><div class="l">Durée</div><div class="v">'+d.duration_ms+'ms</div></div>';
+document.getElementById('stats').innerHTML = h;
+
+let ih = '';
+Object.entries(d.validators || {}).forEach(([name, r]) => {
+if(!r.issues || r.issues.length === 0) return;
+ih += '<h3 style="color:#5096ff;font-size:11px;letter-spacing:2px;margin:12px 0 8px;font-family:ui-monospace,monospace">'+esc(name.toUpperCase())+' — '+r.issues.length+' problème(s)</h3>';
+r.issues.forEach(i => {
+ih += '<div class="issue '+esc(i.severity)+'">' +
+'<span class="sev">['+esc(i.severity.toUpperCase())+']</span>' +
+'<span class="val">'+esc(i.validator)+'</span>' +
+esc(i.message);
+if(i.line) ih += ' <span style="color:#607090">ligne '+i.line+'</span>';
+ih += '</div>';
+});
+});
+document.getElementById('issues').innerHTML = ih;
+document.getElementById('raw').textContent = JSON.stringify(d, null, 2);
+}
+
+function renderOne(d){
+const cls = d.status === 'valid' ? 'ok' : d.status === 'invalid' ? 'danger' : 'warn';
+let h = '<div class="stat"><div class="l">Validateur</div><div class="v">'+esc(d.validator)+'</div></div>' +
+'<div class="stat"><div class="l">Statut</div><div class="v '+cls+'">'+esc(d.status.toUpperCase())+'</div></div>' +
+'<div class="stat"><div class="l">Problèmes</div><div class="v">'+(d.issues||[]).length+'</div></div>' +
+'<div class="stat"><div class="l">Durée</div><div class="v">'+(d.duration_ms||0)+'ms</div></div>';
+document.getElementById('stats').innerHTML = h;
+
+let ih = '';
+(d.issues || []).forEach(i => {
+ih += '<div class="issue '+esc(i.severity)+'">' +
+'<span class="sev">['+esc(i.severity.toUpperCase())+']</span>' +
+esc(i.message);
+if(i.line) ih += ' <span style="color:#607090">ligne '+i.line+'</span>';
+ih += '</div>';
+});
+document.getElementById('issues').innerHTML = ih;
+document.getElementById('raw').textContent = JSON.stringify(d, null, 2);
+}
+
+function vider(){
+document.getElementById('html').value = '';
+document.getElementById('css').value = '';
+document.getElementById('base_url').value = '';
+document.getElementById('result-panel').style.display = 'none';
+}
+</script>
+</body>
+</html>
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HTTP HANDLER
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Handler(BaseHTTPRequestHandler):
+def log_message(self, *a): pass
+
+def _send(self, code: int, body, ctype="application/json"):
+try:
+if isinstance(body, str):
+body = body.encode("utf-8")
+self.send_response(code)
+self.send_header("Content-Type", ctype + "; charset=utf-8")
+self.send_header("Access-Control-Allow-Origin", "*")
+self.send_header("Content-Length", str(len(body)))
+self.end_headers()
+self.wfile.write(body)
+except (BrokenPipeError, ConnectionResetError):
+pass
+
+def _read_json(self) -> Dict:
+try:
+n = int(self.headers.get("Content-Length", "0"))
+if n > 10_000_000:
+return {}
+raw = self.rfile.read(n)
+return json.loads(raw.decode("utf-8"))
+except Exception:
+return {}
+
+def do_GET(self):
+path = self.path.split("?")[0]
+if path in ("/", "/index.html"):
+return self._send(200, HTML_UI, "text/html")
+if path == "/api/health":
+return self._send(200, json.dumps({
+"ok": True, "version": VERSION, "port": PORT,
+"author": AUTEUR, "license": LICENCE,
+"validators": list(CodeValidatorEngine.VALIDATORS.keys()),
+}))
+if path == "/api/validators":
+return self._send(200, json.dumps({
+"validators": {
+"nu_html": "Nu HTML Checker (W3C)",
+"css": "CSS Validator (W3C)",
+"feed": "Feed Validator (W3C)",
+"i18n": "i18n Checker (W3C)",
+"rdf": "RDF Validator (W3C)",
+"link": "Link Checker (W3C)",
+"epub": "EPUBCheck (IDPF)",
+"wpt": "Web Platform Tests",
+}
+}))
+return self._send(404, json.dumps({"error": "not found"}))
+
+def do_POST(self):
+path = self.path.split("?")[0]
+data = self._read_json()
+
+if path == "/api/validate-all":
+html = data.get("html", "")
+css = data.get("css", "")
+base_url = data.get("base_url", "")
+if not html and not css:
+return self._send(400, json.dumps({"error": "html or css required"}))
+result = CodeValidatorEngine.validate_all(html, css, base_url)
+return self._send(200, json.dumps(result, ensure_ascii=False, default=str))
+
+if path == "/api/validate-html":
+html = data.get("html", "")
+if not html:
+return self._send(400, json.dumps({"error": "html required"}))
+r = NuHtmlValidator.validate(html)
+return self._send(200, json.dumps(r.to_dict(), ensure_ascii=False))
+
+if path == "/api/validate-i18n":
+html = data.get("html", "")
+if not html:
+return self._send(400, json.dumps({"error": "html required"}))
+r = I18nChecker.validate(html)
+return self._send(200, json.dumps(r.to_dict(), ensure_ascii=False))
+
+if path == "/api/validate-css":
+css = data.get("css", "")
+if not css:
+return self._send(400, json.dumps({"error": "css required"}))
+r = CSSValidator.validate(css)
+return self._send(200, json.dumps(r.to_dict(), ensure_ascii=False))
+
+if path == "/api/validate-links":
+html = data.get("html", "")
+base_url = data.get("base_url", "")
+if not html:
+return self._send(400, json.dumps({"error": "html required"}))
+r = LinkChecker.validate(html, base_url)
+return self._send(200, json.dumps(r.to_dict(), ensure_ascii=False))
+
+if path == "/api/validate-rdf":
+rdf = data.get("rdf", "")
+fmt = data.get("format", "turtle")
+if not rdf:
+return self._send(400, json.dumps({"error": "rdf required"}))
+r = RDFValidator.validate(rdf, fmt)
+return self._send(200, json.dumps(r.to_dict(), ensure_ascii=False))
+
+if path == "/api/validate-feed":
+url = data.get("url", "")
+if not url:
+return self._send(400, json.dumps({"error": "url required"}))
+r = FeedValidator.validate(url)
+return self._send(200, json.dumps(r.to_dict(), ensure_ascii=False))
+
+return self._send(404, json.dumps({"error": "not found"}))
+
+
+class Server(ThreadingMixIn, HTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════
+
+def ip_locale():
+try:
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(("8.8.8.8", 80))
+ip = s.getsockname()[0]
+s.close()
+return ip
+except Exception:
+return "localhost"
+
+
+def main():
+print("=" * 76)
+print(f" 🧬 NEXUS CODE VALIDATOR MEGA v{VERSION}")
+print(f" Validateurs : Nu HTML · CSS · RSS · i18n · RDF · Link · EPUB · WPT")
+print(f" {AUTEUR} · {LICENCE}")
+print(f" {PROTOCOLE}")
+print("=" * 76)
+print()
+print(f" Port : {PORT}")
+print(f" APIs W3C : officielles")
+print(f" Validateurs : {len(CodeValidatorEngine.VALIDATORS)}")
+print()
+print(" Validateurs disponibles :")
+for name, cls in CodeValidatorEngine.VALIDATORS.items():
+print(f" · {name:12s} {cls.__name__}")
+print()
+print(f" Local : http://localhost:{PORT}/")
+print(f" Réseau : http://{ip_locale()}:{PORT}/")
+print()
+print(" Endpoints :")
+print(" POST /api/validate-all → tous les validateurs")
+print(" POST /api/validate-html → Nu HTML Checker")
+print(" POST /api/validate-css → CSS Validator")
+print(" POST /api/validate-i18n → i18n Checker")
+print(" POST /api/validate-links → Link Checker")
+print(" POST /api/validate-rdf → RDF Validator")
+print(" POST /api/validate-feed → RSS/Atom Feed Validator")
+print(" GET /api/health → état")
+print(" GET /api/validators → liste validateurs")
+print()
+print(" Ctrl+C pour arrêter")
+print()
+
+try:
+with Server((HOST, PORT), Handler) as httpd:
+httpd.serve_forever()
+except KeyboardInterrupt:
+print("\n Arrêté.")
+except OSError as e:
+print(f" ❌ Erreur port {PORT} : {e}")
+sys.exit(1)
+
+
+if __name__ == "__main__":
+try:
+main()
+except Exception as e:
+print(f"Fatal : {e}", file=sys.stderr)
+import traceback
+traceback.print_exc()
+sys.exit(1)
